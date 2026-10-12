@@ -1,0 +1,101 @@
+---
+name: REA Update
+
+# Opens a PR bumping rea-agents in .mcp.json and re-syncing the skill
+# whenever npm has a newer release.
+
+on:
+  schedule:
+    - cron: '17 4 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  pull-requests: write
+
+concurrency:
+  group: rea-update
+  cancel-in-progress: false
+
+jobs:
+  update:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.repository.default_branch }}
+
+      - name: Check Workflow Kill Switch
+        id: killswitch
+        run: |
+          if [ -f ".github/WORKFLOW_KILLSWITCH" ]; then
+            STATUS=$(grep "STATUS:" .github/WORKFLOW_KILLSWITCH | awk '{print $2}')
+            if [ "$STATUS" = "DISABLED" ]; then
+              echo "disabled=true" >> "$GITHUB_OUTPUT"
+            fi
+          fi
+
+      - name: Setup Node
+        if: steps.killswitch.outputs.disabled != 'true'
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - name: Compare pinned and latest versions
+        if: steps.killswitch.outputs.disabled != 'true'
+        id: versions
+        run: |
+          set -euo pipefail
+          PINNED=$(node -e "const a=require('./.mcp.json').mcpServers.rea.args;const p=a.find(x=>x.startsWith('rea-agents@'));console.log(p.split('@')[1])")
+          LATEST=$(npm view rea-agents version)
+          echo "pinned=$PINNED latest=$LATEST"
+          echo "pinned=$PINNED" >> "$GITHUB_OUTPUT"
+          echo "latest=$LATEST" >> "$GITHUB_OUTPUT"
+          if [ "$PINNED" != "$LATEST" ]; then
+            echo "outdated=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Apply update
+        if: steps.versions.outputs.outdated == 'true'
+        env:
+          LATEST: ${{ steps.versions.outputs.latest }}
+        run: |
+          set -euo pipefail
+          WORK="$RUNNER_TEMP/rea"
+          mkdir -p "$WORK"
+          npm pack "rea-agents@$LATEST" --pack-destination "$WORK" >/dev/null
+          tar -xzf "$WORK"/rea-agents-*.tgz -C "$WORK"
+          SRC="$WORK/package/skills/reverse-engineer-anything"
+          test -f "$SRC/SKILL.md"
+          DEST=".claude/skills/reverse-engineer-anything"
+          rm -rf "$DEST"
+          cp -r "$SRC" "$DEST"
+          node -e "
+            const fs=require('fs');const f='.mcp.json';const c=JSON.parse(fs.readFileSync(f,'utf8'));
+            c.mcpServers.rea.args=c.mcpServers.rea.args.map(x=>x.startsWith('rea-agents@')?'rea-agents@'+process.env.LATEST:x);
+            fs.writeFileSync(f,JSON.stringify(c,null,2)+'\n');"
+
+      - name: Open pull request
+        if: steps.versions.outputs.outdated == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PINNED: ${{ steps.versions.outputs.pinned }}
+          LATEST: ${{ steps.versions.outputs.latest }}
+          BASE: ${{ github.event.repository.default_branch }}
+        run: |
+          set -euo pipefail
+          BRANCH="rea-update/$LATEST"
+          if git ls-remote --exit-code --heads origin "$BRANCH" >/dev/null; then
+            echo "Update branch $BRANCH already exists"
+            exit 0
+          fi
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git checkout -b "$BRANCH"
+          git add .mcp.json .claude/skills/reverse-engineer-anything
+          git commit -m "chore(tooling): bump rea-agents from $PINNED to $LATEST"
+          git push -u origin "$BRANCH"
+          gh pr create --base "$BASE" --head "$BRANCH" \
+            --title "chore(tooling): bump rea-agents from $PINNED to $LATEST" \
+            --body "Bumps rea-agents to $LATEST and re-syncs the REA skill. Changelog: https://github.com/morluto/rea/blob/main/CHANGELOG.md"
